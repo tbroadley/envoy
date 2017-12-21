@@ -192,7 +192,8 @@ private:
     };
 
     struct ClusterEntry : public ThreadLocalCluster {
-      ClusterEntry(ThreadLocalClusterManagerImpl& parent, ClusterInfoConstSharedPtr cluster);
+      ClusterEntry(ThreadLocalClusterManagerImpl& parent, ClusterInfoConstSharedPtr cluster,
+                   const LoadBalancerFactorySharedPtr& lb_factory);
       ~ClusterEntry();
 
       Http::ConnectionPool::Instance* connPool(ResourcePriority priority,
@@ -205,6 +206,9 @@ private:
 
       ThreadLocalClusterManagerImpl& parent_;
       PrioritySetImpl priority_set_;
+      // fixfix comment
+      LoadBalancerFactorySharedPtr lb_factory_;
+      // fixfix comment
       LoadBalancerPtr lb_;
       ClusterInfoConstSharedPtr cluster_info_;
       Http::AsyncClientImpl http_async_client_;
@@ -241,6 +245,7 @@ private:
     const uint64_t config_hash_;
     const bool added_via_api_;
     ClusterSharedPtr cluster_;
+    ThreadAwareLoadBalancerPtr thread_aware_lb_;
   };
 
   static ClusterManagerStats generateStats(Stats::Scope& scope);

@@ -57,5 +57,32 @@ public:
 
 typedef std::unique_ptr<LoadBalancer> LoadBalancerPtr;
 
+/**
+ * Factory for load balancers.
+ */
+class LoadBalancerFactory {
+public:
+  virtual ~LoadBalancerFactory() {}
+
+  /**
+   * @return LoadBalancerPtr a new load balancer.
+   */
+  virtual LoadBalancerPtr create() PURE;
+};
+
+typedef std::shared_ptr<LoadBalancerFactory> LoadBalancerFactorySharedPtr;
+
+/**
+ * fixfix
+ */
+class ThreadAwareLoadBalancer {
+public:
+  virtual ~ThreadAwareLoadBalancer() {}
+
+  virtual LoadBalancerFactorySharedPtr factory() PURE;
+};
+
+typedef std::unique_ptr<ThreadAwareLoadBalancer> ThreadAwareLoadBalancerPtr;
+
 } // namespace Upstream
 } // namespace Envoy

@@ -14,29 +14,35 @@ RingHashLoadBalancer::RingHashLoadBalancer(
     PrioritySet& priority_set, ClusterStats& stats, Runtime::Loader& runtime,
     Runtime::RandomGenerator& random,
     const Optional<envoy::api::v2::Cluster::RingHashLbConfig>& config)
-    : LoadBalancerBase(priority_set, stats, runtime, random), config_(config) {
-  priority_set.addMemberUpdateCb(
-      [this](uint32_t priority, const std::vector<HostSharedPtr>&,
-             const std::vector<HostSharedPtr>&) -> void { refresh(priority); });
+    : LoadBalancerBase(priority_set, stats, runtime, random), config_(config),
+      factory_(new LoadBalancerFactoryImpl(stats, random)) {
+  priority_set.addMemberUpdateCb([this](uint32_t, const std::vector<HostSharedPtr>&,
+                                        const std::vector<HostSharedPtr>&) -> void { refresh(); });
 
-  for (auto& host_set : priority_set_.hostSetsPerPriority()) {
-    refresh(host_set->priority());
-  }
+  refresh();
 }
 
-HostConstSharedPtr RingHashLoadBalancer::chooseHost(LoadBalancerContext* context) {
-  if (isGlobalPanic(*best_available_host_set_, runtime_)) {
+HostConstSharedPtr
+RingHashLoadBalancer::LoadBalancerImpl::chooseHost(LoadBalancerContext* context) {
+  if (global_panic_) {
     stats_.lb_healthy_panic_.inc();
-    return per_priority_state_[bestAvailablePriority()]->all_hosts_ring_.chooseHost(context,
-                                                                                    random_);
-  } else {
-    return per_priority_state_[bestAvailablePriority()]->healthy_hosts_ring_.chooseHost(context,
-                                                                                        random_);
   }
+  return ring_->chooseHost(context, random_);
+}
+
+LoadBalancerPtr RingHashLoadBalancer::LoadBalancerFactoryImpl::create() {
+  // fixfix comment
+  RingConstSharedPtr ring_to_use;
+  {
+    std::shared_lock<std::shared_timed_mutex> lock(mutex_);
+    ring_to_use = current_ring_;
+  }
+
+  return std::make_unique<LoadBalancerImpl>(stats_, random_, ring_to_use, global_panic_);
 }
 
 HostConstSharedPtr RingHashLoadBalancer::Ring::chooseHost(LoadBalancerContext* context,
-                                                          Runtime::RandomGenerator& random) {
+                                                          Runtime::RandomGenerator& random) const {
   if (ring_.empty()) {
     return nullptr;
   }
@@ -82,11 +88,9 @@ HostConstSharedPtr RingHashLoadBalancer::Ring::chooseHost(LoadBalancerContext* c
   }
 }
 
-void RingHashLoadBalancer::Ring::create(
-    const Optional<envoy::api::v2::Cluster::RingHashLbConfig>& config,
-    const std::vector<HostSharedPtr>& hosts) {
+RingHashLoadBalancer::Ring::Ring(const Optional<envoy::api::v2::Cluster::RingHashLbConfig>& config,
+                                 const std::vector<HostSharedPtr>& hosts) {
   ENVOY_LOG(trace, "ring hash: building ring");
-  ring_.clear();
   if (hosts.empty()) {
     return;
   }
@@ -138,13 +142,18 @@ void RingHashLoadBalancer::Ring::create(
 #endif
 }
 
-void RingHashLoadBalancer::refresh(uint32_t priority) {
-  while (per_priority_state_.size() < priority + 1) {
-    per_priority_state_.push_back(PerPriorityStatePtr{new PerPriorityState});
+void RingHashLoadBalancer::refresh() {
+  RingConstSharedPtr new_ring;
+  if (isGlobalPanic(*best_available_host_set_, runtime_)) {
+    new_ring = std::make_shared<Ring>(config_, best_available_host_set_->hosts());
+    factory_->global_panic_ = true;
+  } else {
+    new_ring = std::make_shared<Ring>(config_, best_available_host_set_->healthyHosts());
+    factory_->global_panic_ = false;
   }
-  auto& host_set = priority_set_.hostSetsPerPriority()[priority];
-  per_priority_state_[priority]->all_hosts_ring_.create(config_, host_set->hosts());
-  per_priority_state_[priority]->healthy_hosts_ring_.create(config_, host_set->healthyHosts());
+
+  std::unique_lock<std::shared_timed_mutex> lock(factory_->mutex_);
+  factory_->current_ring_ = new_ring;
 }
 
 } // namespace Upstream

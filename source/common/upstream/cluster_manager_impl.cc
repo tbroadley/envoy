@@ -230,8 +230,7 @@ ClusterManagerImpl::ClusterManagerImpl(const envoy::api::v2::Bootstrap& bootstra
 
   tls_->set([this, local_cluster_name](
                 Event::Dispatcher& dispatcher) -> ThreadLocal::ThreadLocalObjectSharedPtr {
-    return ThreadLocal::ThreadLocalObjectSharedPtr{
-        new ThreadLocalClusterManagerImpl(*this, dispatcher, local_cluster_name)};
+    return std::make_shared<ThreadLocalClusterManagerImpl>(*this, dispatcher, local_cluster_name);
   });
 
   init_helper_.onStaticLoadComplete();
@@ -290,9 +289,17 @@ bool ClusterManagerImpl::addOrUpdatePrimaryCluster(const envoy::api::v2::Cluster
   }
 
   loadCluster(cluster, true);
-  ClusterInfoConstSharedPtr new_cluster = primary_clusters_.at(cluster_name).cluster_->info();
+  auto& primary_cluster_entry = primary_clusters_.at(cluster_name);
+  ClusterInfoConstSharedPtr new_cluster = primary_cluster_entry.cluster_->info();
+
+  // fixfix dup code.
+  LoadBalancerFactorySharedPtr thread_aware_lb_factory;
+  if (primary_cluster_entry.thread_aware_lb_ != nullptr) {
+    thread_aware_lb_factory = primary_cluster_entry.thread_aware_lb_->factory();
+  }
+
   ENVOY_LOG(info, "add/update cluster {}", cluster_name);
-  tls_->runOnAllThreads([this, new_cluster]() -> void {
+  tls_->runOnAllThreads([this, new_cluster, thread_aware_lb_factory]() -> void {
     ThreadLocalClusterManagerImpl& cluster_manager =
         tls_->getTyped<ThreadLocalClusterManagerImpl>();
 
@@ -303,10 +310,11 @@ bool ClusterManagerImpl::addOrUpdatePrimaryCluster(const envoy::api::v2::Cluster
     }
 
     cluster_manager.thread_local_clusters_[new_cluster->name()].reset(
-        new ThreadLocalClusterManagerImpl::ClusterEntry(cluster_manager, new_cluster));
+        new ThreadLocalClusterManagerImpl::ClusterEntry(cluster_manager, new_cluster,
+                                                        thread_aware_lb_factory));
   });
 
-  postInitializeCluster(*primary_clusters_.at(cluster_name).cluster_);
+  postInitializeCluster(*primary_cluster_entry.cluster_);
   return true;
 }
 
@@ -345,7 +353,7 @@ void ClusterManagerImpl::loadCluster(const envoy::api::v2::Cluster& cluster, boo
     }
   }
 
-  const Cluster& primary_cluster_reference = *new_cluster;
+  Cluster& primary_cluster_reference = *new_cluster;
   new_cluster->prioritySet().addMemberUpdateCb(
       [&primary_cluster_reference, this](uint32_t priority,
                                          const std::vector<HostSharedPtr>& hosts_added,
@@ -375,9 +383,18 @@ void ClusterManagerImpl::loadCluster(const envoy::api::v2::Cluster& cluster, boo
 
   // emplace() will do nothing if the key already exists. Always erase first.
   size_t num_erased = primary_clusters_.erase(primary_cluster_reference.info()->name());
-  primary_clusters_.emplace(
-      primary_cluster_reference.info()->name(),
-      PrimaryClusterData{MessageUtil::hash(cluster), added_via_api, std::move(new_cluster)});
+  auto cluster_entry_it = primary_clusters_
+                              .emplace(primary_cluster_reference.info()->name(),
+                                       PrimaryClusterData{MessageUtil::hash(cluster), added_via_api,
+                                                          std::move(new_cluster)})
+                              .first;
+
+  // fixfix comment
+  if (primary_cluster_reference.info()->lbType() == LoadBalancerType::RingHash) {
+    cluster_entry_it->second.thread_aware_lb_ = std::make_unique<RingHashLoadBalancer>(
+        primary_cluster_reference.prioritySet(), primary_cluster_reference.info()->stats(),
+        runtime_, random_, primary_cluster_reference.info()->lbRingHashConfig());
+  }
 
   cm_stats_.total_clusters_.set(primary_clusters_.size());
   if (num_erased) {
@@ -491,9 +508,14 @@ ClusterManagerImpl::ThreadLocalClusterManagerImpl::ThreadLocalClusterManagerImpl
   // If local cluster is defined then we need to initialize it first.
   if (local_cluster_name.valid()) {
     ENVOY_LOG(debug, "adding TLS local cluster {}", local_cluster_name.value());
-    auto& local_cluster = parent.primary_clusters_.at(local_cluster_name.value()).cluster_;
+    const auto& local_cluster = parent.primary_clusters_.at(local_cluster_name.value());
+
+    LoadBalancerFactorySharedPtr lb_factory; // fixfix dup code
+    if (local_cluster.thread_aware_lb_ != nullptr) {
+      lb_factory = local_cluster.thread_aware_lb_->factory();
+    }
     thread_local_clusters_[local_cluster_name.value()].reset(
-        new ClusterEntry(*this, local_cluster->info()));
+        new ClusterEntry(*this, local_cluster.cluster_->info(), lb_factory));
   }
 
   local_priority_set_ = local_cluster_name.valid()
@@ -508,8 +530,13 @@ ClusterManagerImpl::ThreadLocalClusterManagerImpl::ThreadLocalClusterManagerImpl
 
     ENVOY_LOG(debug, "adding TLS initial cluster {}", cluster.first);
     ASSERT(thread_local_clusters_.count(cluster.first) == 0);
+
+    LoadBalancerFactorySharedPtr lb_factory; // fixfix dup code
+    if (cluster.second.thread_aware_lb_ != nullptr) {
+      lb_factory = cluster.second.thread_aware_lb_->factory();
+    }
     thread_local_clusters_[cluster.first].reset(
-        new ClusterEntry(*this, cluster.second.cluster_->info()));
+        new ClusterEntry(*this, cluster.second.cluster_->info(), lb_factory));
   }
 }
 
@@ -584,9 +611,15 @@ void ClusterManagerImpl::ThreadLocalClusterManagerImpl::updateClusterMembership(
   ThreadLocalClusterManagerImpl& config = tls.getTyped<ThreadLocalClusterManagerImpl>();
 
   ASSERT(config.thread_local_clusters_.find(name) != config.thread_local_clusters_.end());
-  config.thread_local_clusters_[name]->priority_set_.getOrCreateHostSet(priority).updateHosts(
+  const auto& cluster_entry = config.thread_local_clusters_[name];
+  cluster_entry->priority_set_.getOrCreateHostSet(priority).updateHosts(
       std::move(hosts), std::move(healthy_hosts), std::move(hosts_per_locality),
       std::move(healthy_hosts_per_locality), hosts_added, hosts_removed);
+
+  // fixfix comment
+  if (cluster_entry->lb_factory_ != nullptr) {
+    cluster_entry->lb_ = cluster_entry->lb_factory_->create();
+  }
 }
 
 void ClusterManagerImpl::ThreadLocalClusterManagerImpl::onHostHealthFailure(
@@ -612,8 +645,9 @@ void ClusterManagerImpl::ThreadLocalClusterManagerImpl::onHostHealthFailure(
 }
 
 ClusterManagerImpl::ThreadLocalClusterManagerImpl::ClusterEntry::ClusterEntry(
-    ThreadLocalClusterManagerImpl& parent, ClusterInfoConstSharedPtr cluster)
-    : parent_(parent), cluster_info_(cluster),
+    ThreadLocalClusterManagerImpl& parent, ClusterInfoConstSharedPtr cluster,
+    const LoadBalancerFactorySharedPtr& lb_factory)
+    : parent_(parent), lb_factory_(lb_factory), cluster_info_(cluster),
       http_async_client_(*cluster, parent.parent_.stats_, parent.thread_local_dispatcher_,
                          parent.parent_.local_info_, parent.parent_, parent.parent_.runtime_,
                          parent.parent_.random_,
@@ -621,6 +655,7 @@ ClusterManagerImpl::ThreadLocalClusterManagerImpl::ClusterEntry::ClusterEntry(
   priority_set_.getOrCreateHostSet(0);
 
   if (cluster->lbSubsetInfo().isEnabled()) {
+    ASSERT(lb_factory_ == nullptr);
     lb_.reset(new SubsetLoadBalancer(cluster->lbType(), priority_set_, parent_.local_priority_set_,
                                      cluster->stats(), parent.parent_.runtime_,
                                      parent.parent_.random_, cluster->lbSubsetInfo(),
@@ -628,28 +663,32 @@ ClusterManagerImpl::ThreadLocalClusterManagerImpl::ClusterEntry::ClusterEntry(
   } else {
     switch (cluster->lbType()) {
     case LoadBalancerType::LeastRequest: {
+      ASSERT(lb_factory_ == nullptr);
       lb_.reset(new LeastRequestLoadBalancer(priority_set_, parent_.local_priority_set_,
                                              cluster->stats(), parent.parent_.runtime_,
                                              parent.parent_.random_));
       break;
     }
     case LoadBalancerType::Random: {
+      ASSERT(lb_factory_ == nullptr);
       lb_.reset(new RandomLoadBalancer(priority_set_, parent_.local_priority_set_, cluster->stats(),
                                        parent.parent_.runtime_, parent.parent_.random_));
       break;
     }
     case LoadBalancerType::RoundRobin: {
+      ASSERT(lb_factory_ == nullptr);
       lb_.reset(new RoundRobinLoadBalancer(priority_set_, parent_.local_priority_set_,
                                            cluster->stats(), parent.parent_.runtime_,
                                            parent.parent_.random_));
       break;
     }
     case LoadBalancerType::RingHash: {
-      lb_.reset(new RingHashLoadBalancer(priority_set_, cluster->stats(), parent.parent_.runtime_,
-                                         parent.parent_.random_, cluster->lbRingHashConfig()));
+      ASSERT(lb_factory_ != nullptr);
+      lb_ = lb_factory_->create();
       break;
     }
     case LoadBalancerType::OriginalDst: {
+      ASSERT(lb_factory_ == nullptr);
       lb_.reset(new OriginalDstCluster::LoadBalancer(
           priority_set_, parent.parent_.primary_clusters_.at(cluster->name()).cluster_));
       break;
